@@ -1,405 +1,621 @@
-import json
+import os
+import re
+import base64
+from io import BytesIO
+from typing import Optional, List, Dict
+
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
-st.set_page_config(page_title="RAJ GROUP Pricebook", layout="wide")
+from PIL import Image, ImageEnhance
 
-# -------------------- Helpers --------------------
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+
+# ================= CONFIG =================
+st.set_page_config(page_title="RAJ GROUP • Catalog", layout="wide")
+
+MAX_CARDS = 240
+DEFAULT_DATA_PATH = os.path.join("data", "master.xlsx")
+LOGO_PATH = os.path.join("assets", "logo.png")
+
+# THEME COLORS
+DARK_BLUE = colors.HexColor("#0B1B3B")
+ORANGE = colors.HexColor("#F47C20")
+LIGHT_BG = colors.HexColor("#F7F9FF")
+
+# ================= CSS =================
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 1.0rem; }
+      h1, h2, h3 { letter-spacing: 0.2px; }
+      .raj-pill {
+        display:inline-block; border:1px solid rgba(255,255,255,0.30);
+        padding:3px 10px; border-radius:999px; margin-right:6px;
+        background: rgba(11,27,59,0.07);
+      }
+      .raj-hr { border:0; height:1px; background: rgba(255,255,255,0.08); margin: 10px 0; }
+      /* Make selectboxes nicer on dark screenshots vibe */
+      div[data-baseweb="select"] > div {
+        border-radius: 10px !important;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# ================= HELPERS =================
 @st.cache_data(show_spinner=False)
-def read_sheet(uploaded_file, sheet_name: str) -> pd.DataFrame:
-    return pd.read_excel(uploaded_file, sheet_name=sheet_name)
-
-def norm(s: str) -> str:
-    return str(s).strip().lower()
+def read_sheet(path_or_file, sheet_name: str) -> pd.DataFrame:
+    return pd.read_excel(path_or_file, sheet_name=sheet_name)
 
 def safe_str_series(s: pd.Series) -> pd.Series:
     return s.astype("string").fillna("")
 
-def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = {norm(c): c for c in df.columns}
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = {str(c).strip().lower(): c for c in df.columns}
     for cand in candidates:
-        if norm(cand) in cols:
-            return cols[norm(cand)]
+        key = cand.lower()
+        if key in cols:
+            return cols[key]
     return None
 
-def apply_multiselect_filters(df: pd.DataFrame, filters: dict[str, list[str]]) -> pd.DataFrame:
-    out = df
-    for col, selected in filters.items():
-        if not selected or col not in out.columns:
-            continue
-        out = out[safe_str_series(out[col]).isin([str(x) for x in selected])]
-    return out
-
-def apply_contains_search(df: pd.DataFrame, cols: list[str], q: str) -> pd.DataFrame:
-    q = (q or "").strip().lower()
+def df_contains_search(df: pd.DataFrame, cols: List[Optional[str]], q: str) -> pd.DataFrame:
+    q = (q or "").lower().strip()
     if not q:
         return df
     mask = False
     for c in cols:
-        if c in df.columns:
-            mask = mask | safe_str_series(df[c]).str.lower().str.contains(q, na=False)
+        if c and c in df.columns:
+            mask = mask | safe_str_series(df[c]).str.lower().str.contains(re.escape(q), na=False)
     return df[mask]
 
-def to_whatsapp_lines(df: pd.DataFrame, code_col: str | None, desc_col: str | None, mrp_col: str | None, max_rows=200):
-    out = df.head(max_rows)
-    lines = []
-    for _, r in out.iterrows():
-        code = str(r[code_col]) if code_col and code_col in out.columns else ""
-        desc = str(r[desc_col]) if desc_col and desc_col in out.columns else ""
-        mrp = str(r[mrp_col]) if mrp_col and mrp_col in out.columns else ""
-        code = code.strip()
-        desc = desc.strip()
-        mrp = mrp.strip()
-        if mrp:
-            lines.append(f"{code} - {desc} | MRP: {mrp}")
-        else:
-            lines.append(f"{code} - {desc}")
-    return "\n".join([ln for ln in lines if ln.strip()])
+def normalize_filename(name: str) -> str:
+    # remove spaces, make lower
+    return re.sub(r"\s+", "", (name or "").strip().lower())
 
-def copy_to_clipboard_js(text: str):
-    # Small HTML/JS snippet to copy text to clipboard
-    escaped = text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
-    html = f"""
-    <script>
-    navigator.clipboard.writeText(`{escaped}`).then(() => {{
-      const el = document.getElementById("copystatus");
-      if (el) el.innerText = "Copied ✅";
-    }});
-    </script>
-    <div id="copystatus" style="font-family: system-ui; font-size: 13px; opacity: 0.8;"></div>
+def pil_to_bytes(img: Image.Image, fmt="PNG", quality=90) -> bytes:
+    buf = BytesIO()
+    save_kwargs = {}
+    if fmt.upper() in ("JPG", "JPEG"):
+        save_kwargs["quality"] = quality
+    img.save(buf, format=fmt, **save_kwargs)
+    return buf.getvalue()
+
+def load_logo_pil() -> Optional[Image.Image]:
+    if os.path.exists(LOGO_PATH):
+        return Image.open(LOGO_PATH).convert("RGBA")
+    return None
+
+def apply_center_watermark(base_img: Image.Image, logo: Optional[Image.Image], opacity=0.18, scale=0.35) -> Image.Image:
     """
-    components.html(html, height=30)
-
-# -------------------- Styling --------------------
-st.markdown(
+    base_img: RGB/RGBA
+    watermark logo will be centered with given opacity and scale relative to base width
     """
-    <style>
-      .raj-banner {
-        background: linear-gradient(90deg, #b71c1c, #e53935);
-        border-radius: 18px;
-        padding: 16px 18px;
-        margin-bottom: 14px;
-        display:flex;
-        align-items:center;
-        justify-content:space-between;
-        gap: 12px;
-      }
-      .raj-banner h1 {
-        color: white;
-        font-size: 30px;
-        margin: 0;
-        font-weight: 900;
-        letter-spacing: 0.4px;
-      }
-      .raj-banner p {
-        color: rgba(255,255,255,0.88);
-        margin: 4px 0 0 0;
-        font-size: 13px;
-      }
-      .pill {
-        background: rgba(255,255,255,0.16);
-        color: white;
-        border: 1px solid rgba(255,255,255,0.22);
-        padding: 6px 10px;
-        border-radius: 999px;
-        font-size: 12px;
-        white-space:nowrap;
-      }
+    img = base_img.convert("RGBA")
+    if logo is None:
+        return img
 
-      div.stButton > button {
-        border-radius: 14px !important;
-        font-weight: 800 !important;
-        padding: 0.6rem 0.9rem !important;
-      }
+    w, h = img.size
+    # scale logo
+    target_w = int(w * scale)
+    if target_w <= 1:
+        return img
+    ratio = target_w / logo.size[0]
+    target_h = max(1, int(logo.size[1] * ratio))
+    wm = logo.resize((target_w, target_h), Image.LANCZOS)
 
-      /* Red button look */
-      .redbtn div.stButton > button {
-        background: #e53935 !important;
-        color: white !important;
-        border: 1px solid #e53935 !important;
-      }
-      .redbtn div.stButton > button:hover {
-        background: #c62828 !important;
-        border: 1px solid #c62828 !important;
-      }
+    # apply opacity
+    alpha = wm.split()[-1]
+    alpha = ImageEnhance.Brightness(alpha).enhance(opacity)
+    wm.putalpha(alpha)
 
-      /* Neutral button look */
-      .neutralbtn div.stButton > button {
-        background: transparent !important;
-        color: inherit !important;
-        border: 1px solid rgba(255,255,255,0.18) !important;
-      }
-      .neutralbtn div.stButton > button:hover {
-        border: 1px solid rgba(255,255,255,0.32) !important;
-      }
+    # center paste
+    x = (w - wm.size[0]) // 2
+    y = (h - wm.size[1]) // 2
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    overlay.paste(wm, (x, y), wm)
+    out = Image.alpha_composite(img, overlay)
+    return out
 
-      @media (max-width: 768px) {
-        .raj-banner h1 { font-size: 22px; }
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def badge(txt: str) -> str:
+    return f"<span class='raj-pill'>{txt}</span>"
 
-# -------------------- Sidebar: Data --------------------
+def guess_image_key(code: str) -> str:
+    return normalize_filename(code)
+
+# ================= LOAD DATA =================
 with st.sidebar:
     st.header("Data")
-    uploaded = st.file_uploader("Upload Excel (.xlsx/.xlsm)", type=["xlsx", "xlsm"])
-    st.caption("Tip: Aap naya Excel upload karoge to new columns automatically aa jayenge.")
 
-if not uploaded:
-    st.info("Upload your Excel file to start.")
-    st.stop()
+uploaded_xl = st.sidebar.file_uploader(
+    "Upload Excel (optional)",
+    type=["xlsx", "xlsm", "xls"]
+)
 
-xl = pd.ExcelFile(uploaded)
+# NEW: image uploader
+uploaded_imgs = st.sidebar.file_uploader(
+    "Upload Product Images (optional, multiple)",
+    type=["png", "jpg", "jpeg", "webp"],
+    accept_multiple_files=True
+)
 
-with st.sidebar:
-    sheet = st.selectbox("Sheet", xl.sheet_names, index=0)
+if uploaded_xl is not None:
+    xl = pd.ExcelFile(uploaded_xl)
+    sheet = st.sidebar.selectbox("Sheet", xl.sheet_names)
+    df = read_sheet(uploaded_xl, sheet)
+else:
+    if not os.path.exists(DEFAULT_DATA_PATH):
+        st.error("❌ data/master.xlsx missing. Please upload or add file.")
+        st.stop()
+    xl = pd.ExcelFile(DEFAULT_DATA_PATH)
+    sheet = xl.sheet_names[0]
+    df = read_sheet(DEFAULT_DATA_PATH, sheet)
 
-df = read_sheet(uploaded, sheet)
 df.columns = [str(c).strip() for c in df.columns]
 
-# Auto-detect columns
-col_segment = find_col(df, ["SEGMENT", "Segment"])
-col_code = find_col(df, ["CODE", "Code", "PART NO", "PARTNO", "PART_NO"])
-col_desc = find_col(df, ["DESCRIPTION", "Description", "ITEM", "ITEM NAME"])
-col_mrp = find_col(df, ["MRP", "LIST", "LIST PRICE", "PRICE"])
-col_brand = find_col(df, ["VEHICLE BRAND", "BRAND", "Vehicle Brand"])
-col_vehicle = find_col(df, ["VEHICLE", "Vehicle"])
-col_model = find_col(df, ["MODEL", "Model"])
-col_category = find_col(df, ["CATEGORY NAME", "CATEGORY", "Category Name", "Category"])
-col_group = find_col(df, ["GROUP", "Group"])
-col_gst = find_col(df, ["GST", "TAX"])
-col_disc = find_col(df, ["DISC", "DISCOUNT"])
+# ================= DETECT COLUMNS =================
+col_code = pick_col(df, ["code", "part no", "part_no", "item code", "itemcode"])
+col_desc = pick_col(df, ["description", "item name", "item", "name"])
+col_mrp = pick_col(df, ["mrp", "price", "list price"])
+col_rate = pick_col(df, ["rate", "sale rate", "net rate"])
+col_unit = pick_col(df, ["unit", "uom"])
+col_group = pick_col(df, ["group"])
+col_segment = pick_col(df, ["segment", "segment (deduped)", "segment_deduped"])
+col_hsn = pick_col(df, ["hsn", "hsn code"])
+col_gst = pick_col(df, ["gst", "tax", "gst %", "gst%"])
+col_category = pick_col(df, ["category"])
 
-# -------------------- Top Banner + Logo --------------------
-left_banner, right_banner = st.columns([3.2, 1.2])
+# NEW: vehicle brand/model columns
+col_v_brand = pick_col(df, ["vehicle brand", "brand", "veh brand", "vehicle_brand", "veh_brand"])
+col_v_model = pick_col(df, ["vehicle model", "model", "veh model", "vehicle_model", "veh_model"])
 
-with left_banner:
-    st.markdown(
-        f"""
-        <div class="raj-banner">
-          <div>
-            <h1>RAJ GROUP • Pricebook</h1>
-            <p>One-tap Segment • Advanced filters • Mobile view • WhatsApp export</p>
-          </div>
-          <div class="pill">Rows: {len(df):,}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# NEW: image column (optional)
+col_img = pick_col(df, ["image", "img", "photo", "picture", "image file", "image_file", "image path", "image_path", "filename"])
 
-with right_banner:
-    # Optional logo: upload OR keep blank
-    logo = st.file_uploader("Logo (optional)", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
-    if logo:
-        st.image(logo, use_container_width=True)
+# ================= PREP IMAGE MAP (from uploads) =================
+# key: normalized filename without extension, value: bytes of image
+uploaded_image_map: Dict[str, bytes] = {}
+if uploaded_imgs:
+    for uf in uploaded_imgs:
+        stem = os.path.splitext(uf.name)[0]
+        uploaded_image_map[normalize_filename(stem)] = uf.getvalue()
 
-# -------------------- Top Controls --------------------
-top_a, top_b, top_c = st.columns([2.2, 2.0, 1.2])
+logo_pil = load_logo_pil()
 
-with top_a:
-    search_cols = [c for c in [col_code, col_desc] if c]
-    if not search_cols:
-        search_cols = df.columns.tolist()
-    q = st.text_input("Search (Code/Description)", value="", placeholder="Type part no / description...")
+# ================= HEADER =================
+c1, c2 = st.columns([1, 4])
 
-with top_c:
-    mobile_mode = st.toggle("📱 Mobile mode", value=True)
+with c1:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH)
 
-# Segment quick buttons
-if "segment_quick" not in st.session_state:
-    st.session_state.segment_quick = None
+with c2:
+    st.title("RAJ GROUP • Catalog")
+    st.caption("Public searchable product catalog")
 
-def set_segment(val):
-    st.session_state.segment_quick = val
+# ================= FILTERS =================
+st.subheader("Filters")
 
+# Layout similar to SS: Group + Segment on top row
+frow1_a, frow1_b = st.columns(2)
+frow2_a, frow2_b, frow2_c = st.columns(3)
+
+selected_group = None
+selected_segment = None
+selected_brand = None
+selected_model = None
+
+out = df.copy()
+
+# Group dropdown
+if col_group:
+    groups = sorted([g for g in df[col_group].dropna().unique().tolist() if str(g).strip() != ""])
+    with frow1_a:
+        selected_group = st.selectbox("Group (type here to search)", groups, index=0 if groups else None)
+
+# Segment dropdown
 if col_segment:
-    seg_vals = sorted([x for x in safe_str_series(df[col_segment]).unique().tolist() if x != ""])
-    prefer = ["CAR", "HCV", "LCV"]
-    ordered = [p for p in prefer if p in seg_vals] + [x for x in seg_vals if x not in prefer]
+    segs = sorted([s for s in df[col_segment].dropna().unique().tolist() if str(s).strip() != ""])
+    with frow1_b:
+        # allow "ALL"
+        seg_opts = ["ALL"] + segs
+        selected_segment = st.selectbox("Segment (deduped)", seg_opts, index=0)
 
-    with top_b:
-        st.write("Quick Segment")
-        b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
-        active = st.session_state.segment_quick
+# Vehicle Brand / Model dropdowns
+if col_v_brand:
+    brands = sorted([b for b in df[col_v_brand].dropna().unique().tolist() if str(b).strip() != ""])
+    with frow2_a:
+        selected_brand = st.selectbox("Vehicle Brand", ["ALL"] + brands, index=0)
 
-        def btn(label, container):
-            klass = "redbtn" if active == label else "neutralbtn"
-            with container:
-                st.markdown(f'<div class="{klass}">', unsafe_allow_html=True)
-                if st.button(label, use_container_width=True):
-                    set_segment(label)
-                st.markdown("</div>", unsafe_allow_html=True)
+if col_v_model:
+    with frow2_b:
+        if col_v_brand and selected_brand and selected_brand != "ALL":
+            models = sorted([
+                m for m in df.loc[safe_str_series(df[col_v_brand]) == str(selected_brand), col_v_model]
+                .dropna().unique().tolist()
+                if str(m).strip() != ""
+            ])
+        else:
+            models = sorted([m for m in df[col_v_model].dropna().unique().tolist() if str(m).strip() != ""])
+        selected_model = st.selectbox("Vehicle Model", ["ALL"] + models, index=0)
 
-        shown = ordered[:3]
-        if len(shown) >= 1: btn(shown[0], b1)
-        if len(shown) >= 2: btn(shown[1], b2)
-        if len(shown) >= 3: btn(shown[2], b3)
+with frow2_c:
+    search_q = st.text_input("Search (Code / Description)")
+    mobile_mode = st.toggle("📱 Mobile compact", value=True)
 
-        with b4:
-            st.markdown('<div class="neutralbtn">', unsafe_allow_html=True)
-            if st.button("Clear", use_container_width=True):
-                set_segment(None)
-            st.markdown("</div>", unsafe_allow_html=True)
+# ================= APPLY FILTERS =================
+if selected_group and col_group:
+    out = out[safe_str_series(out[col_group]) == str(selected_group)]
 
-# -------------------- Sidebar: Filters + Columns --------------------
-with st.sidebar:
-    st.header("Filters")
+if col_segment and selected_segment and selected_segment != "ALL":
+    out = out[safe_str_series(out[col_segment]) == str(selected_segment)]
 
-    default_filters = [c for c in [col_segment, col_vehicle, col_model, col_brand, col_category, col_group] if c]
-    filter_cols = st.multiselect(
-        "Filter fields (choose dropdowns)",
-        options=df.columns.tolist(),
-        default=default_filters
-    )
+if col_v_brand and selected_brand and selected_brand != "ALL":
+    out = out[safe_str_series(out[col_v_brand]) == str(selected_brand)]
 
-    filters = {}
-    for col in filter_cols:
-        if col not in df.columns:
-            continue
-        options = [x for x in safe_str_series(df[col]).unique().tolist() if x != ""]
-        options = sorted(options)
-        filters[col] = st.multiselect(col, options=options)
+if col_v_model and selected_model and selected_model != "ALL":
+    out = out[safe_str_series(out[col_v_model]) == str(selected_model)]
 
-    st.header("Columns")
-    default_visible = [c for c in [col_code, col_desc, col_mrp, col_disc, col_gst, col_segment, col_vehicle, col_brand, col_model, col_category] if c]
-    visible_cols = st.multiselect(
-        "Visible columns (hide/show)",
-        options=df.columns.tolist(),
-        default=default_visible if default_visible else df.columns.tolist()
-    )
+out = df_contains_search(out, [col_code, col_desc], search_q)
 
-    st.header("Rename columns (optional)")
-    st.caption('Paste JSON mapping, e.g. {"MRP":"LIST PRICE","Code":"PART NO"}')
-    mapping_txt = st.text_area("Column name mapping (JSON)", value="{}", height=110)
-
-# Parse rename mapping
-col_map = {}
-try:
-    col_map = json.loads(mapping_txt) if mapping_txt.strip() else {}
-    if not isinstance(col_map, dict):
-        col_map = {}
-except Exception:
-    st.sidebar.error("Invalid JSON in rename mapping. Using original names.")
-    col_map = {}
-
-# -------------------- Apply Filters --------------------
-filtered = df.copy()
-
-if col_segment and st.session_state.segment_quick:
-    filtered = filtered[safe_str_series(filtered[col_segment]) == st.session_state.segment_quick]
-
-filtered = apply_multiselect_filters(filtered, filters)
-filtered = apply_contains_search(filtered, search_cols, q)
-
-# -------------------- KPIs --------------------
+# ================= KPI =================
 k1, k2, k3 = st.columns(3)
-k1.metric("Rows (total)", f"{len(df):,}")
-k2.metric("Rows (filtered)", f"{len(filtered):,}")
-k3.metric("Columns", f"{len(df.columns):,}")
+k1.metric("Total Rows", f"{len(df):,}")
+k2.metric("Filtered Rows", f"{len(out):,}")
+k3.metric("Showing Cards", f"{min(len(out), MAX_CARDS):,}")
 
-# -------------------- Prepare Display --------------------
-display = filtered.copy()
-rename_ok = {k: v for k, v in col_map.items() if k in display.columns and isinstance(v, str) and v.strip()}
-if rename_ok:
-    display = display.rename(columns=rename_ok)
+# ================= PDF EXPORT 1: A4 TABLE =================
+st.subheader("Print / Export")
 
-# Visible columns after rename
-final_cols = [rename_ok.get(c, c) for c in visible_cols]
-final_cols = [c for c in final_cols if c in display.columns]
-if not final_cols:
-    final_cols = display.columns.tolist()
+def build_a4_table_pdf(df_in: pd.DataFrame, title: str, group_name: str = "") -> bytes:
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=14, rightMargin=14, topMargin=18, bottomMargin=18)
+    styles = getSampleStyleSheet()
 
-# Mobile compact: keep essentials
-if mobile_mode:
-    priority = [rename_ok.get(x, x) for x in [col_code, col_desc, col_mrp, col_disc, col_gst, col_segment, col_vehicle, col_brand, col_model] if x]
-    pr = [c for c in priority if c in display.columns]
-    if pr:
-        final_cols = pr
+    title_style = ParagraphStyle(
+        "rajTitle",
+        parent=styles["Title"],
+        textColor=DARK_BLUE,
+        fontSize=18,
+        spaceAfter=8
+    )
+    sub_style = ParagraphStyle(
+        "rajSub",
+        parent=styles["Normal"],
+        textColor=colors.HexColor("#333333"),
+        fontSize=10,
+        spaceAfter=10
+    )
 
-# -------------------- Copy Code + WhatsApp Export --------------------
-st.subheader("Quick Actions")
+    story = []
 
-act1, act2 = st.columns([1.4, 2.6])
+    # Logo
+    if os.path.exists(LOGO_PATH):
+        try:
+            story.append(RLImage(LOGO_PATH, width=40*mm, height=18*mm))
+            story.append(Spacer(1, 6))
+        except:
+            pass
 
-with act1:
-    # Pick a row to copy its code (first 500 to keep UI fast)
-    st.caption("Copy Code")
-    if col_code and len(filtered) > 0:
-        sample = filtered.head(500).copy()
-        sample_codes = safe_str_series(sample[col_code]).tolist()
-        selected_code = st.selectbox("Select code", options=sample_codes, index=0)
-        cbtn1, cbtn2 = st.columns([1,1])
-        with cbtn1:
-            if st.button("Copy selected code"):
-                copy_to_clipboard_js(selected_code)
-        with cbtn2:
-            st.code(selected_code, language=None)
-    else:
-        st.info("Code column not found or no data.")
+    head = title
+    if group_name:
+        head = f"{title} — {group_name}"
+    story.append(Paragraph(head, title_style))
+    story.append(Paragraph("Generated from RAJ GROUP catalog", sub_style))
+    story.append(Spacer(1, 8))
 
-with act2:
-    st.caption("WhatsApp share format")
-    wa_text = to_whatsapp_lines(filtered, col_code, col_desc, col_mrp, max_rows=200)
-    st.text_area("Copy/paste to WhatsApp (first 200 rows)", value=wa_text, height=140)
-    wa_cols = st.columns([1,1,1])
-    with wa_cols[0]:
-        if st.button("Copy WhatsApp text"):
-            copy_to_clipboard_js(wa_text)
-    with wa_cols[1]:
-        st.download_button(
-            "Download .txt",
-            data=wa_text.encode("utf-8"),
-            file_name="raj_pricebook_whatsapp.txt",
-            mime="text/plain"
-        )
-    with wa_cols[2]:
-        st.download_button(
-            "Download filtered CSV",
-            data=display[final_cols].to_csv(index=False).encode("utf-8"),
-            file_name="raj_pricebook_filtered.csv",
-            mime="text/csv"
-        )
+    # Limit columns for readability (still includes "all" present in df_in)
+    data = [df_in.columns.tolist()] + df_in.astype(str).values.tolist()
+    table = Table(data, repeatRows=1)
 
-# -------------------- Styled Table (Row highlight + MRP bold) --------------------
-st.subheader("Filtered Results")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BLUE),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 9),
 
-# For styling, keep it reasonable in size for speed (large datasets can be heavy with styler)
-MAX_STYLE_ROWS = 1500
-show_df = display[final_cols].copy().head(MAX_STYLE_ROWS)
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#B9C3D6")),
+        ("FONTSIZE", (0, 1), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_BG]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+    ]))
 
-mrp_show_col = rename_ok.get(col_mrp, col_mrp) if col_mrp else None
-seg_show_col = rename_ok.get(col_segment, col_segment) if col_segment else None
+    story.append(table)
+    doc.build(story)
+    return buf.getvalue()
 
-def style_rows(row):
-    styles = [""] * len(row)
+# build small table for quick A4
+pdf_a4_bytes = build_a4_table_pdf(out.head(120), "RAJ GROUP — A4 Catalog Table", group_name=str(selected_group or ""))
 
-    # Row highlighting by Segment (subtle)
-    if seg_show_col and seg_show_col in row.index:
-        val = str(row[seg_show_col]).upper()
-        if val == "LCV":
-            styles = ["background-color: rgba(229,57,53,0.10);"] * len(row)
-        elif val == "HCV":
-            styles = ["background-color: rgba(255,193,7,0.10);"] * len(row)
-        elif val == "CAR":
-            styles = ["background-color: rgba(76,175,80,0.10);"] * len(row)
+st.download_button("⬇️ Download A4 PDF (Table)", data=pdf_a4_bytes, file_name="catalog_a4_table.pdf")
 
-    return styles
+# ================= PDF EXPORT 2: PRICE BOOK / CATALOG WITH IMAGES =================
+st.caption("⬇️ नीचे वाला PDF: Images + full product info (Price Book / Catalog)")
 
-styler = show_df.style.apply(style_rows, axis=1)
+def resolve_image_bytes(row) -> Optional[bytes]:
+    """
+    Try resolve image from:
+    1) Excel image column: value = filename (match uploaded map)
+    2) Excel image column: value = path on server (if exists)
+    3) Uploaded images by CODE filename
+    """
+    code = str(row[col_code]) if col_code else ""
+    code_key = guess_image_key(code)
 
-# Bold MRP column
-if mrp_show_col and mrp_show_col in show_df.columns:
-    styler = styler.set_properties(subset=[mrp_show_col], **{"font-weight": "800"})
+    # 3) match by code
+    if code_key in uploaded_image_map:
+        return uploaded_image_map[code_key]
 
-# Tight font for mobile
-styler = styler.set_table_styles([
-    {"selector": "th", "props": [("font-weight", "800")]},
-    {"selector": "td", "props": [("font-size", "13px")]},
-])
+    # 1/2) if excel has image column
+    if col_img and col_img in row.index:
+        raw = str(row[col_img] or "").strip()
+        if raw and raw.lower() != "nan":
+            stem = os.path.splitext(os.path.basename(raw))[0]
+            key = normalize_filename(stem)
+            if key in uploaded_image_map:
+                return uploaded_image_map[key]
+            # if it's a local path on server
+            if os.path.exists(raw):
+                try:
+                    with open(raw, "rb") as f:
+                        return f.read()
+                except:
+                    pass
 
-st.dataframe(styler, use_container_width=True, height=520)
+    return None
 
-st.caption(f"Showing styled preview: first {min(len(display), MAX_STYLE_ROWS):,} rows (styling large data can be heavy).")
+def build_pricebook_pdf(df_in: pd.DataFrame, title: str, group_name: str = "") -> bytes:
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=14, rightMargin=14, topMargin=16, bottomMargin=16)
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "pbTitle",
+        parent=styles["Title"],
+        textColor=DARK_BLUE,
+        fontSize=18,
+        spaceAfter=6
+    )
+    meta_style = ParagraphStyle(
+        "pbMeta",
+        parent=styles["Normal"],
+        textColor=colors.HexColor("#333333"),
+        fontSize=10,
+        spaceAfter=10
+    )
+
+    story = []
+
+    # Header row: logo + title + group
+    if os.path.exists(LOGO_PATH):
+        try:
+            story.append(RLImage(LOGO_PATH, width=42*mm, height=19*mm))
+            story.append(Spacer(1, 6))
+        except:
+            pass
+
+    head = title
+    if group_name:
+        head = f"{title} — {group_name}"
+    story.append(Paragraph(head, title_style))
+    story.append(Paragraph("RAJ GROUP • Price Book / Catalog (with images)", meta_style))
+    story.append(Spacer(1, 8))
+
+    # Build rows as cards in PDF
+    # We'll create a table per product: [image | details]
+    for _, r in df_in.iterrows():
+        code = str(r[col_code]) if col_code else ""
+        desc = str(r[col_desc]) if col_desc else ""
+        rate = str(r[col_rate]) if col_rate else ""
+        mrp = str(r[col_mrp]) if col_mrp else ""
+        unit = str(r[col_unit]) if col_unit else ""
+        hsn = str(r[col_hsn]) if col_hsn else ""
+        gst = str(r[col_gst]) if col_gst else ""
+        grp = str(r[col_group]) if col_group else ""
+        seg = str(r[col_segment]) if col_segment else ""
+        vbr = str(r[col_v_brand]) if col_v_brand else ""
+        vmo = str(r[col_v_model]) if col_v_model else ""
+
+        # Image
+        img_bytes = resolve_image_bytes(r)
+        img_flow = None
+        if img_bytes:
+            try:
+                pil = Image.open(BytesIO(img_bytes)).convert("RGBA")
+                pil = apply_center_watermark(pil, logo_pil, opacity=0.18, scale=0.42)
+                # convert to png for reportlab
+                png_bytes = pil_to_bytes(pil, fmt="PNG")
+                img_flow = RLImage(BytesIO(png_bytes), width=34*mm, height=34*mm)
+            except:
+                img_flow = None
+
+        details_lines = []
+        if code: details_lines.append(f"<b>CODE:</b> {code}")
+        if desc and desc.lower() != "nan": details_lines.append(f"<b>DESC:</b> {desc}")
+        if unit and unit.lower() != "nan": details_lines.append(f"<b>UNIT:</b> {unit}")
+        if rate and rate.lower() != "nan": details_lines.append(f"<b>RATE:</b> {rate}")
+        if mrp and mrp.lower() != "nan": details_lines.append(f"<b>MRP:</b> {mrp}")
+        if hsn and hsn.lower() != "nan": details_lines.append(f"<b>HSN:</b> {hsn}")
+        if gst and gst.lower() != "nan": details_lines.append(f"<b>GST:</b> {gst}")
+        if grp and grp.lower() != "nan": details_lines.append(f"<b>GROUP:</b> {grp}")
+        if seg and seg.lower() != "nan": details_lines.append(f"<b>SEGMENT:</b> {seg}")
+        if vbr and vbr.lower() != "nan": details_lines.append(f"<b>VEH BRAND:</b> {vbr}")
+        if vmo and vmo.lower() != "nan": details_lines.append(f"<b>VEH MODEL:</b> {vmo}")
+
+        details_html = "<br/>".join(details_lines) if details_lines else ""
+
+        left_cell = img_flow if img_flow else Paragraph("<font color='#999999'>No Image</font>", styles["Normal"])
+        right_cell = Paragraph(details_html, styles["Normal"])
+
+        row_tbl = Table([[left_cell, right_cell]], colWidths=[40*mm, 150*mm])
+        row_tbl.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.7, ORANGE),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+            ("VALIGN", (0, 0), (0, 0), "MIDDLE"),
+            ("VALIGN", (1, 0), (1, 0), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+
+        story.append(row_tbl)
+        story.append(Spacer(1, 8))
+
+    doc.build(story)
+    return buf.getvalue()
+
+# Limit pricebook size to keep performance ok (you can increase)
+pricebook_limit = min(len(out), 300)
+pricebook_pdf = build_pricebook_pdf(out.head(pricebook_limit), "RAJ GROUP Price Book", group_name=str(selected_group or ""))
+
+st.download_button(
+    "⬇️ Download Price Book / Catalog PDF (with images)",
+    data=pricebook_pdf,
+    file_name="raj_group_price_book.pdf"
+)
+
+# ================= PRODUCTS GRID =================
+st.subheader("Products")
+
+N = min(len(out), MAX_CARDS)
+data = out.head(N)
+
+grid_cols = st.columns(2 if mobile_mode else 3)
+
+def render_zoomable_image(img_bytes: bytes, caption: str = ""):
+    """
+    HTML Lightbox zoom. Streamlit native click-zoom is limited,
+    so we use a small HTML/JS overlay.
+    """
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    html = f"""
+    <style>
+      .raj-img-wrap {{
+        position: relative;
+        border-radius: 14px;
+        overflow: hidden;
+        border: 1px solid rgba(11,27,59,0.10);
+        cursor: zoom-in;
+      }}
+      .raj-img {{
+        width: 100%;
+        display: block;
+      }}
+      .raj-modal {{
+        display:none;
+        position: fixed;
+        z-index: 999999;
+        left: 0; top: 0;
+        width: 100%; height: 100%;
+        background: rgba(0,0,0,0.75);
+      }}
+      .raj-modal-content {{
+        position: absolute;
+        top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        max-width: 92%;
+        max-height: 92%;
+        border-radius: 14px;
+        overflow: hidden;
+        box-shadow: 0 10px 40px rgba(0,0,0,0.45);
+      }}
+      .raj-modal-content img {{
+        width: 100%;
+        height: auto;
+        display: block;
+      }}
+      .raj-close {{
+        position: absolute;
+        right: 18px; top: 12px;
+        font-size: 28px;
+        color: white;
+        cursor: pointer;
+        user-select: none;
+      }}
+      .raj-cap {{
+        color: rgba(255,255,255,0.85);
+        text-align:center;
+        margin-top: 10px;
+        font-size: 13px;
+      }}
+    </style>
+
+    <div class="raj-img-wrap" onclick="document.getElementById('rajModal_{caption}').style.display='block'">
+      <img class="raj-img" src="data:image/png;base64,{b64}" />
+    </div>
+
+    <div id="rajModal_{caption}" class="raj-modal" onclick="this.style.display='none'">
+      <div class="raj-close" onclick="document.getElementById('rajModal_{caption}').style.display='none'">&times;</div>
+      <div class="raj-modal-content">
+        <img src="data:image/png;base64,{b64}" />
+      </div>
+      <div class="raj-cap">{caption}</div>
+    </div>
+    """
+    st.components.v1.html(html, height=260, scrolling=False)
+
+for i, (_, r) in enumerate(data.iterrows()):
+    with grid_cols[i % len(grid_cols)]:
+        st.markdown("<div class='raj-hr'></div>", unsafe_allow_html=True)
+
+        code = str(r[col_code]) if col_code else ""
+        desc = str(r[col_desc]) if col_desc else ""
+        rate = str(r[col_rate]) if col_rate else ""
+        mrp = str(r[col_mrp]) if col_mrp else ""
+        unit = str(r[col_unit]) if col_unit else ""
+        hsn = str(r[col_hsn]) if col_hsn else ""
+        gst = str(r[col_gst]) if col_gst else ""
+        grp = str(r[col_group]) if col_group else ""
+        seg = str(r[col_segment]) if col_segment else ""
+        vbr = str(r[col_v_brand]) if col_v_brand else ""
+        vmo = str(r[col_v_model]) if col_v_model else ""
+
+        st.markdown(f"### {code}" if code else "### Item")
+        if desc and desc.lower() != "nan":
+            st.write(desc)
+
+        # IMAGE (with watermark + zoom)
+        img_bytes = resolve_image_bytes(r)
+        if img_bytes:
+            try:
+                pil = Image.open(BytesIO(img_bytes)).convert("RGBA")
+                pil = apply_center_watermark(pil, logo_pil, opacity=0.18, scale=0.42)
+                disp_bytes = pil_to_bytes(pil, fmt="PNG")
+                render_zoomable_image(disp_bytes, caption=code or "Product")
+            except:
+                st.image(img_bytes, caption=code or "")
+        else:
+            st.info("No image (upload image named like CODE.jpg or give image column).")
+
+        badges = []
+        if rate and rate.lower() != "nan":
+            badges.append(badge(f"RATE: {rate}"))
+        if mrp and mrp.lower() != "nan":
+            badges.append(badge(f"MRP: {mrp}"))
+        if unit and unit.lower() != "nan":
+            badges.append(badge(f"UNIT: {unit}"))
+        if hsn and hsn.lower() != "nan":
+            badges.append(badge(f"HSN: {hsn}"))
+        if gst and gst.lower() != "nan":
+            badges.append(badge(f"GST: {gst}"))
+        if grp and grp.lower() != "nan":
+            badges.append(badge(f"GROUP: {grp}"))
+        if seg and seg.lower() != "nan":
+            badges.append(badge(f"SEG: {seg}"))
+        if vbr and vbr.lower() != "nan":
+            badges.append(badge(f"BRAND: {vbr}"))
+        if vmo and vmo.lower() != "nan":
+            badges.append(badge(f"MODEL: {vmo}"))
+
+        if badges:
+            st.markdown(" ".join(badges), unsafe_allow_html=True)
+
+st.caption(f"Showing {N} products")
